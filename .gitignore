@@ -22,3 +22,21 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+
+# Secretos y variables privadas
+.env
+.env.*
+!.env.example
+
+# Backend
+server/node_modules/
+server/dist/
+server/data/
+*.db
+*.db-shm
+*.db-wal
+# Claves privadas
+*.pem
+*.key
+

@@ -1,185 +1,305 @@
+import type { FastifyInstance } from "fastify";
+import { randomBytes } from "node:crypto";
 
-import type { FastifyPluginAsync } from "fastify";
+import { db } from "../../database/database.js";
 import {
-  randomBytes,
-  timingSafeEqual,
-} from "node:crypto";
+  encryptToken,
+} from "../../database/encryption.js";
 
 import {
-  createOAuthState,
   createMetaAuthUrl,
   exchangeMetaCode,
   exchangeLongLivedToken,
 } from "./meta.oauth.js";
 
-import {
-  getMetaAccounts,
-  type ConnectedAccount,
-} from "./meta.accounts.js";
+import { getMetaAccounts } from "./meta.accounts.js";
 
-type Session = {
-  oauthState?: string;
-  accounts: ConnectedAccount[];
-  userToken?: string;
-  pageTokens: Map<string, string>;
+const COOKIE_NAME = "nf_session";
+
+type SessionRow = {
+  id: string;
+  oauth_state: string | null;
+  user_token_encrypted: string | null;
+  token_expires_at: number | null;
 };
 
-const sessions = new Map<string, Session>();
+type AccountRow = {
+  id: string;
+  platform: string;
+  name: string;
+  username: string | null;
+  page_id: string | null;
+  page_token_encrypted: string | null;
+};
 
-function equal(a?: string, b?: string) {
-  if (!a || !b) return false;
-  const x = Buffer.from(a);
-  const y = Buffer.from(b);
+const cookieOptions = {
+  httpOnly: true,
+  sameSite: "lax" as const,
+  secure: process.env.NODE_ENV === "production",
+  path: "/",
+};
 
-  return (
-    x.length === y.length &&
-    timingSafeEqual(x, y)
-  );
+function createSessionId(): string {
+  return randomBytes(32).toString("hex");
 }
 
-function getSession(
-  request: { cookies: Record<string, string | undefined> },
+function getSession(id: string): SessionRow | undefined {
+  return db.prepare(`
+    SELECT *
+    FROM meta_sessions
+    WHERE id = ?
+  `).get(id) as SessionRow | undefined;
+}
+
+function ensureSession(
+  request: {
+    cookies: Record<string, string | undefined>;
+  },
   reply: {
-    setCookie: (name: string, value: string, options: object) => unknown;
+    setCookie: (
+      name: string,
+      value: string,
+      options: typeof cookieOptions & { maxAge: number }
+    ) => unknown;
   }
-) {
-  let id = request.cookies.nf_session;
+): string {
+  const existingId = request.cookies[COOKIE_NAME];
 
-  if (!id || !sessions.has(id)) {
-    id = randomBytes(32).toString("hex");
-    sessions.set(id, {
-      accounts: [],
-      pageTokens: new Map(),
-    });
-
-    reply.setCookie("nf_session", id, {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: false,
-      path: "/api/meta",
-    });
+  if (existingId && getSession(existingId)) {
+    return existingId;
   }
 
-  return sessions.get(id)!;
+  const id = createSessionId();
+  const now = Date.now();
+
+  db.prepare(`
+    INSERT INTO meta_sessions (
+      id, created_at, updated_at
+    )
+    VALUES (?, ?, ?)
+  `).run(id, now, now);
+
+  reply.setCookie(COOKIE_NAME, id, {
+    ...cookieOptions,
+    maxAge: 60 * 60 * 24 * 30,
+  });
+
+  return id;
 }
 
-export const metaRoutes: FastifyPluginAsync =
-  async (app) => {
-    // Solo para desarrollo local.
-    app.addHook("onRequest", async (request, reply) => {
-      const host = request.hostname.split(":")[0];
+export async function metaRoutes(app: FastifyInstance) {
+  app.get("/connect", async (request, reply) => {
+    const sessionId = ensureSession(
+      request,
+      reply
+    );
 
-      if (host !== "localhost" && host !== "127.0.0.1") {
-        return reply.code(403).send({
-          error: "LOCAL_DEVELOPMENT_ONLY",
-        });
-      }
-    });
+    const state = randomBytes(32).toString("hex");
 
-    app.get("/status", async () => ({
-      configured: Boolean(
-        process.env.META_APP_ID &&
-        process.env.META_APP_SECRET &&
-        process.env.META_REDIRECT_URI
-      ),
-    }));
+    db.prepare(`
+      UPDATE meta_sessions
+      SET oauth_state = ?,
+          updated_at = ?
+      WHERE id = ?
+    `).run(state, Date.now(), sessionId);
 
-    app.get("/accounts", async (request, reply) => {
-      const session = getSession(request, reply);
-      return { accounts: session.accounts };
-    });
+    return reply.redirect(createMetaAuthUrl(state));
+  });
 
-    app.get("/connect", async (request, reply) => {
-      if (
-        !process.env.META_APP_ID ||
-        !process.env.META_APP_SECRET
-      ) {
-        return reply.code(503).send({
-          error: "META_NOT_CONFIGURED",
-        });
-      }
+  app.get<{
+    Querystring: {
+      code?: string;
+      state?: string;
+      error?: string;
+    };
+  }>("/callback", async (request, reply) => {
+    const sessionId = request.cookies[COOKIE_NAME];
 
-      const session = getSession(request, reply);
-      const state = createOAuthState();
+    if (!sessionId) {
+      return reply.code(400).send({
+        error: "Sesión OAuth no encontrada",
+      });
+    }
 
-      session.oauthState = state;
+    const session = getSession(sessionId);
 
-      return reply.redirect(createMetaAuthUrl(state));
-    });
+    if (
+      !session ||
+      !session.oauth_state ||
+      !request.query.state ||
+      session.oauth_state !== request.query.state ||
+      !request.query.code
+    ) {
+      return reply.code(400).send({
+        error: "Estado OAuth inválido",
+      });
+    }
 
-    app.get<{
-      Querystring: {
-        code?: string;
-        state?: string;
-        error?: string;
-      };
-    }>("/callback", async (request, reply) => {
-      const session = getSession(request, reply);
-      const { code, state, error } = request.query;
+    // Consumimos el state para evitar reutilizarlo.
+    db.prepare(`
+      UPDATE meta_sessions
+      SET oauth_state = NULL,
+          updated_at = ?
+      WHERE id = ?
+    `).run(Date.now(), sessionId);
 
-      const expected = session.oauthState;
-      session.oauthState = undefined;
+    try {
+      const shortToken = await exchangeMetaCode(
+        request.query.code
+      );
 
-      if (!equal(state, expected)) {
-        return reply.code(400).send({
-          error: "INVALID_OAUTH_STATE",
-        });
-      }
+      const longToken = await exchangeLongLivedToken(
+        shortToken.access_token
+      );
 
-      if (error || !code) {
-        return reply.redirect(
-          `${process.env.FRONTEND_URL}/accounts?meta=denied`
+      const token = longToken.access_token;
+
+      const result = await getMetaAccounts(token);
+
+      const expiresAt = longToken.expires_in
+        ? Date.now() + longToken.expires_in * 1000
+        : null;
+
+      const saveAccounts = db.transaction(() => {
+        db.prepare(`
+          UPDATE meta_sessions
+          SET user_token_encrypted = ?,
+              token_expires_at = ?,
+              updated_at = ?
+          WHERE id = ?
+        `).run(
+          encryptToken(token),
+          expiresAt,
+          Date.now(),
+          sessionId
         );
-      }
 
-      try {
-        const shortToken = await exchangeMetaCode(code);
+        db.prepare(`
+          DELETE FROM meta_accounts
+          WHERE session_id = ?
+        `).run(sessionId);
 
-        let token = shortToken.access_token;
+        const insert = db.prepare(`
+          INSERT INTO meta_accounts (
+            session_id,
+            id,
+            platform,
+            name,
+            username,
+            page_id,
+            page_token_encrypted
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `);
 
-        try {
-          const longToken =
-            await exchangeLongLivedToken(token);
-
-          token = longToken.access_token;
-        } catch {
-          app.log.warn(
-            "No se obtuvo token de larga duración"
+        for (const account of result.accounts) {
+          insert.run(
+            sessionId,
+            account.id,
+            account.platform,
+            account.name,
+            null,
+            null
           );
         }
 
-        const result = await getMetaAccounts(token);
+        // Guardamos las credenciales de cada página
+        // sin devolverlas al frontend.
+        for (const page of result.pages) {
+          db.prepare(`
+            UPDATE meta_accounts
+            SET page_id = ?,
+                page_token_encrypted = ?
+            WHERE session_id = ?
+              AND id = ?
+              AND platform = 'facebook'
+          `).run(
+            page.id,
+            page.access_token
+              ? encryptToken(page.access_token)
+              : null,
+            sessionId,
+            page.id
+          );
+        }
+      });
 
-        session.userToken = token;
-        session.accounts = result.accounts;
-        session.pageTokens = new Map(
-          result.pages
-            .filter((p) => p.access_token)
-            .map((p) => [p.id, p.access_token!])
-        );
+      saveAccounts();
 
-        return reply.redirect(
-          `${process.env.FRONTEND_URL}/accounts?meta=connected`
-        );
-      } catch (err) {
-        app.log.error(
-          { err },
-          "Error conectando cuentas de Meta"
-        );
+      const frontend =
+        process.env.FRONTEND_URL ??
+        "http://localhost:5173";
 
-        return reply.redirect(
-          `${process.env.FRONTEND_URL}/accounts?meta=error`
-        );
-      }
+      return reply.redirect(
+        `${frontend}/accounts?meta=connected`
+      );
+    } catch (error) {
+      app.log.error(error, "Error conectando Meta");
+
+      return reply.code(502).send({
+        error: "No se pudo completar la conexión con Meta",
+      });
+    }
+  });
+
+  app.get("/accounts", async (request) => {
+    const sessionId = request.cookies[COOKIE_NAME];
+
+    if (!sessionId || !getSession(sessionId)) {
+      return { accounts: [] };
+    }
+
+    const rows = db.prepare(`
+      SELECT id, platform, name, username
+      FROM meta_accounts
+      WHERE session_id = ?
+      ORDER BY name
+    `).all(sessionId) as Array<
+      Pick<AccountRow, "id" | "platform" | "name" | "username">
+    >;
+
+    return {
+      accounts: rows.map((row) => ({
+        id: row.id,
+        platform: row.platform,
+        name: row.name,
+        username: row.username,
+      })),
+    };
+  });
+
+  app.get("/status", async (request) => {
+    const sessionId = request.cookies[COOKIE_NAME];
+
+    if (!sessionId) {
+      return { connected: false };
+    }
+
+    const session = getSession(sessionId);
+
+    const connected = Boolean(
+      session?.user_token_encrypted &&
+      (!session.token_expires_at ||
+        session.token_expires_at > Date.now())
+    );
+
+    return { connected };
+  });
+
+  app.post("/disconnect", async (request, reply) => {
+    const sessionId = request.cookies[COOKIE_NAME];
+
+    if (sessionId) {
+      db.prepare(`
+        DELETE FROM meta_sessions
+        WHERE id = ?
+      `).run(sessionId);
+    }
+
+    reply.clearCookie(COOKIE_NAME, {
+      path: "/",
     });
 
-    app.post("/disconnect", async (request, reply) => {
-      const session = getSession(request, reply);
-
-      session.accounts = [];
-      session.userToken = undefined;
-      session.pageTokens.clear();
-
-      return { success: true };
-    });
-  };
+    return { success: true };
+  });
+}
