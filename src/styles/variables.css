@@ -1,0 +1,31 @@
+
+:root {
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  color-scheme: dark;
+
+  --bg: #0b0d12;
+  --surface: #12151c;
+  --surface-hover: #1b202a;
+  --surface-raised: #181c25;
+
+  --border: #252a35;
+  --border-strong: #343b49;
+
+  --text: #f1f3f8;
+  --text-secondary: #9aa3b3;
+  --text-muted: #687386;
+
+  --accent: #8b9dff;
+  --accent-soft: rgba(139, 157, 255, 0.12);
+
+  --success: #4bd6a0;
+  --warning: #eab86b;
+  --danger: #f17887;
+
+  --sidebar-width: 248px;
+  --topbar-height: 82px;
+
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+}
