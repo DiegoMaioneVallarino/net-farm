@@ -6,6 +6,7 @@ import cors from "@fastify/cors";
 import cookie from "@fastify/cookie";
 
 import { metaRoutes } from "./modules/meta/meta.routes.js";
+import { publisherRoutes } from "./modules/publisher/publisher.routes.js";
 
 const app = Fastify({
   logger: true,
@@ -28,6 +29,10 @@ app.get("/api/health", async () => {
 
 await app.register(metaRoutes, {
   prefix: "/api/meta",
+});
+
+await app.register(publisherRoutes, {
+  prefix: "/api/publisher",
 });
 
 const PORT = Number(process.env.PORT ?? 3001);

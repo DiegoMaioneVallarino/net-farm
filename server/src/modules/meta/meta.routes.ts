@@ -14,8 +14,7 @@ import {
 
 import { getMetaAccounts } from "./meta.accounts.js";
 
-const COOKIE_NAME = "nf_session";
-
+const COOKIE_NAME = "nf_session_v2";
 type SessionRow = {
   id: string;
   oauth_state: string | null;
@@ -193,15 +192,16 @@ export async function metaRoutes(app: FastifyInstance) {
         `);
 
         for (const account of result.accounts) {
-          insert.run(
-            sessionId,
-            account.id,
-            account.platform,
-            account.name,
-            null,
-            null
-          );
-        }
+  insert.run(
+    sessionId,          // 1. session_id
+    account.id,         // 2. id
+    account.platform,   // 3. platform
+    account.name,       // 4. name
+    null,               // 5. username
+    null,               // 6. page_id
+    null                // 7. page_token_encrypted
+  );
+}
 
         // Guardamos las credenciales de cada página
         // sin devolverlas al frontend.
